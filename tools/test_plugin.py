@@ -31,6 +31,9 @@ def _stub_modules():
 
             return deco
 
+        def add_url_rule(self, *a, **k):
+            pass
+
     flask.Blueprint = Blueprint
     for name in ("flash", "jsonify", "make_response", "redirect", "render_template", "url_for"):
         setattr(flask, name, lambda *a, **k: None)
@@ -40,6 +43,38 @@ def _stub_modules():
     fl.current_user = types.SimpleNamespace(username="tester", all_subnets=True, role="admin")
     fl.login_required = lambda fn: fn
     sys.modules["flask_login"] = fl
+
+
+class _FakeApp:
+    def register_blueprint(self, bp):
+        pass
+
+
+def _stub_jen_plugin_api(periodic_min_minutes=None):
+    """A stub `jen`/`jen.plugin_api` sufficient for register(app) to run
+    end to end. Returns the list every register_periodic() call is
+    recorded into, as (plugin_id, name, fn, every_minutes) tuples.
+    `periodic_min_minutes=None` omits PERIODIC_MIN_MINUTES entirely, so
+    `from jen.plugin_api import PERIODIC_MIN_MINUTES` raises ImportError
+    the same way it does against a real pre-5.60.1 Jen."""
+    calls = []
+
+    def register_periodic(plugin_id, name, fn, every_minutes):
+        calls.append((plugin_id, name, fn, every_minutes))
+
+    jen_pkg = types.ModuleType("jen")
+    plugin_api = types.ModuleType("jen.plugin_api")
+    plugin_api.register_periodic = register_periodic
+    plugin_api.register_alert_type = lambda *a, **k: None
+    plugin_api.register_row_action = lambda *a, **k: None
+    plugin_api.register_search_provider = lambda *a, **k: None
+    plugin_api.api_key_required = lambda write=False: lambda fn: fn
+    if periodic_min_minutes is not None:
+        plugin_api.PERIODIC_MIN_MINUTES = periodic_min_minutes
+    jen_pkg.plugin_api = plugin_api
+    sys.modules["jen"] = jen_pkg
+    sys.modules["jen.plugin_api"] = plugin_api
+    return calls
 
 
 def load_plugin():
@@ -172,6 +207,30 @@ def main():
         check(gated, f"{fn.__name__} refuses a viewer before touching the request")
     p.current_user.role = "admin"
     check(p._is_admin() is True, "admin role restored for the rest of the run")
+
+    # ── register(): the periodic tick is registered at Jen's real floor ─────
+    # (the actual v1.0.1 bug: register_periodic(..., 1) is below Jen's
+    # PERIODIC_MIN_MINUTES=5 and raises, so the plugin never loads at all —
+    # this calls the real register(app) end to end, not just inspects source)
+    calls_with_export = _stub_jen_plugin_api(periodic_min_minutes=7)
+    p.register(_FakeApp())
+    tick_calls = [c for c in calls_with_export if c[1] == "probe-tick"]
+    check(
+        len(tick_calls) == 1 and tick_calls[0][3] == 7,
+        f"register(): uses the exported PERIODIC_MIN_MINUTES when Jen offers it (got {tick_calls})",
+    )
+
+    calls_without_export = _stub_jen_plugin_api(periodic_min_minutes=None)
+    p.register(_FakeApp())
+    tick_calls2 = [c for c in calls_without_export if c[1] == "probe-tick"]
+    check(
+        len(tick_calls2) == 1 and tick_calls2[0][3] == 5,
+        f"register(): falls back to 5 when PERIODIC_MIN_MINUTES isn't exported yet (got {tick_calls2})",
+    )
+    check(
+        all(c[3] >= 5 for c in calls_with_export + calls_without_export),
+        "register_periodic is never called below 5 — Jen's own PERIODIC_MIN_MINUTES floor",
+    )
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")
