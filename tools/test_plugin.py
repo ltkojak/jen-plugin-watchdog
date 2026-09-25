@@ -208,6 +208,234 @@ def main():
     p.current_user.role = "admin"
     check(p._is_admin() is True, "admin role restored for the rest of the run")
 
+    # ── 1.0.2: the first result of a new target is not an alert ─────────────
+    check(
+        p.should_alert("unknown", "up", True) is False,
+        "should_alert: a new target's first success is not 'answering again'",
+    )
+    check(p.should_alert("down", "up", True) is True, "should_alert: down -> up is a recovery worth an alert")
+    check(p.should_alert("up", "down", True) is True, "should_alert: up -> down alerts")
+    check(
+        p.should_alert("unknown", "down", True) is True,
+        "should_alert: a target that never answered and crossed its threshold alerts",
+    )
+    check(p.should_alert("up", "up", False) is False, "should_alert: no transition, no alert")
+
+    # ── a fake database and fake request, to run the impure routes ───────────
+    _stub_jen_plugin_api()
+
+    class FakeDB:
+        def __init__(self, selects=None):
+            self.statements = []
+            self.selects = list(selects or [])
+            self.lastrowid = 5
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql.split()[0].upper(), sql, params))
+
+        def fetchone(self):
+            return self.selects.pop(0) if self.selects else None
+
+        def fetchall(self):
+            return self.selects.pop(0) if self.selects else []
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+        def kinds(self):
+            return [s[0] for s in self.statements]
+
+    only_one = lambda sid: sid == 1  # noqa: E731 - a subnet-restricted caller: subnet 1, and None is not theirs
+    everything = lambda sid: True  # noqa: E731 - an unrestricted caller
+    flashed = []
+    p.flash = lambda msg, cat="message": flashed.append(msg)
+    p.redirect = lambda where: "redirect"
+    p.url_for = lambda *a, **k: "/"
+    p.jsonify = lambda payload: payload
+    p._require_write = lambda: True
+
+    # ── 1.0.2: by-id routes judge the row's OWN subnet ──────────────────────
+    for label, row_subnet in (("a target in subnet 2", 2), ("a target in no subnet", None)):
+        fdb = FakeDB([{"id": 9, "subnet_id": row_subnet, "enabled": 1}])
+        p._get_db = lambda fdb=fdb: fdb
+        p._can = only_one
+        check(
+            p.toggle_target(9) == "redirect" and flashed[-1] == "Target not found.",
+            f"toggle: {label} reads as not found to a caller scoped to subnet 1",
+        )
+        check(fdb.kinds() == ["SELECT"], f"toggle: {label} — nothing was written")
+        fdb = FakeDB([{"id": 9, "subnet_id": row_subnet, "enabled": 1}])
+        p._get_db = lambda fdb=fdb: fdb
+        check(
+            p.delete_target(9) == "redirect" and fdb.kinds() == ["SELECT"],
+            f"delete: {label} is not deleted by a caller scoped to subnet 1",
+        )
+        fdb = FakeDB([{"id": 9, "subnet_id": row_subnet, "enabled": 1}])
+        p._get_db = lambda fdb=fdb: fdb
+        result = p.target_history(9)
+        check(result == ({"error": "not found"}, 404), f"history: {label} is a 404 to a caller scoped to subnet 1")
+
+    fdb = FakeDB([{"id": 9, "subnet_id": 1, "enabled": 1}])
+    p._get_db = lambda fdb=fdb: fdb
+    check(
+        p.toggle_target(9) == "redirect" and "UPDATE" in fdb.kinds(),
+        "toggle: a target in the caller's own subnet is theirs to pause",
+    )
+    fdb = FakeDB([{"id": 9, "subnet_id": None, "enabled": 1}])
+    p._get_db = lambda fdb=fdb: fdb
+    p._can = everything
+    check(
+        p.delete_target(9) == "redirect" and "DELETE" in fdb.kinds(),
+        "delete: an unrestricted caller may remove a target that has no subnet",
+    )
+
+    # ── 1.0.2: "Watch this host" derives the subnet from the ADDRESS ─────────
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    p._can = only_one
+    for label, ip in (("an address in subnet 2", "10.2.0.9"), ("an address in no subnet", "172.16.0.9")):
+        fdb = FakeDB()
+        p._get_db = lambda fdb=fdb: fdb
+        p.request = types.SimpleNamespace(args={"ip": ip, "mac": "", "hostname": "h", "subnet_id": "1"})
+        p.watch_from_row()
+        check(fdb.statements == [], f"watch_from_row: {label} is refused even though the query string claims subnet 1")
+    fdb = FakeDB()
+    p._get_db = lambda fdb=fdb: fdb
+    p.request = types.SimpleNamespace(args={"ip": "10.1.0.9", "mac": "", "hostname": "h", "subnet_id": "2"})
+    p.watch_from_row()
+    inserts = [s for s in fdb.statements if s[0] == "INSERT"]
+    check(
+        len(inserts) == 1 and inserts[0][2][2] == 1,
+        "watch_from_row: stores the subnet the address is in (1), not the one the URL claimed (2)",
+    )
+    p.request = None
+
+    # ── 1.0.2: the JSON API — a scoped key never gets a target with no subnet ─
+    jen_api = sys.modules["jen.plugin_api"]
+
+    def key_can(key, subnet_id, *, allow_unattributed=False):
+        scope = key.get("subnet_ids")
+        if scope is None:
+            return True
+        return subnet_id is not None and subnet_id in scope
+
+    jen_api.api_key_can_access_subnet = key_can
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "k", "subnet_ids": [1]})
+    rows = [
+        {
+            "id": 1,
+            "ip": "10.1.0.5",
+            "mac": "",
+            "label": "mine",
+            "subnet_id": 1,
+            "probe": "ping",
+            "enabled": 1,
+            "state": "up",
+            "uptime_pct": 100,
+        },
+        {
+            "id": 2,
+            "ip": "10.2.0.5",
+            "mac": "",
+            "label": "theirs",
+            "subnet_id": 2,
+            "probe": "ping",
+            "enabled": 1,
+            "state": "up",
+            "uptime_pct": 100,
+        },
+        {
+            "id": 3,
+            "ip": "172.16.0.5",
+            "mac": "",
+            "label": "nowhere",
+            "subnet_id": None,
+            "probe": "ping",
+            "enabled": 1,
+            "state": "up",
+            "uptime_pct": 100,
+        },
+    ]
+    p._target_rows = lambda: rows
+    listed = [t["label"] for t in p._api_list_targets()["targets"]]
+    check(
+        listed == ["mine"],
+        f"api list: a scoped key sees its own subnet's targets only — not a subnet-less one (got {listed})",
+    )
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "all", "subnet_ids": None})
+    listed = [t["label"] for t in p._api_list_targets()["targets"]]
+    check(listed == ["mine", "theirs", "nowhere"], "api list: an unrestricted key sees every target")
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "k", "subnet_ids": [1]})
+    for label, ip in (("subnet 2", "10.2.0.7"), ("no subnet", "172.16.0.7")):
+        fdb = FakeDB()
+        p._get_db = lambda fdb=fdb: fdb
+        p.request = types.SimpleNamespace(get_json=lambda silent=True, ip=ip: {"ip": ip, "label": "x"})
+        result = p._api_add_target()
+        check(result[1] == 403 and fdb.statements == [], f"api add: a scoped key cannot add a target in {label}")
+    fdb = FakeDB()
+    p._get_db = lambda fdb=fdb: fdb
+    p.request = types.SimpleNamespace(get_json=lambda silent=True: {"ip": "10.1.0.7", "label": "x"})
+    result = p._api_add_target()
+    check(
+        isinstance(result, dict) and result.get("ok") is True and "INSERT" in fdb.kinds(),
+        "api add: a scoped key can add a target in its own subnet",
+    )
+    p.request = None
+
+    # ── 1.0.2: the picker never offers a scoped admin another subnet's hosts ─
+    kea_rows = [
+        {"ip": "10.1.0.5", "hostname": "mine", "ident_hex": "AABBCCDDEE01", "ident_type": 0, "subnet_id": 1},
+        {"ip": "10.2.0.5", "hostname": "theirs", "ident_hex": "AABBCCDDEE02", "ident_type": 0, "subnet_id": 2},
+        {"ip": "10.9.0.5", "hostname": "global", "ident_hex": "AABBCCDDEE03", "ident_type": 0, "subnet_id": None},
+    ]
+    ipam_rows = [
+        {"ip": "10.1.0.6", "mac": "", "label": "ipam-mine", "subnet_id": 1},
+        {"ip": "10.2.0.6", "mac": "", "label": "ipam-theirs", "subnet_id": 2},
+    ]
+    for label, can, expected in (
+        ("a scoped admin", only_one, {"mine", "ipam-mine"}),
+        ("an unrestricted admin", everything, {"mine", "theirs", "global", "ipam-mine", "ipam-theirs"}),
+    ):
+        kdb, jdb = FakeDB([list(kea_rows)]), FakeDB([list(ipam_rows)])
+        p._get_kea_db = lambda kdb=kdb: kdb
+        p._get_db = lambda jdb=jdb: jdb
+        p._can = can
+        got = {c["label"] for c in p._candidate_hosts()}
+        check(got == expected, f"_candidate_hosts: {label} is offered {sorted(expected)} (got {sorted(got)})")
+
+    # ── 1.0.2: recording results — UTC timestamps, no alert on a first success ─
+    alerts = []
+    p._alert_transition = lambda target, state: alerts.append((target["id"], state))
+    by_id = {7: {"id": 7, "fails_to_down": 3}}
+    fdb = FakeDB([None])  # no wd_state row yet: a brand-new target
+    p._get_db = lambda: fdb
+    p._record_results(by_id, {7: (True, 4, "")})
+    check(
+        "UTC_TIMESTAMP()" in fdb.statements[0][1] and "checked_at" in fdb.statements[0][1],
+        "_record_results: checked_at is written with UTC_TIMESTAMP(), like every other time in the table",
+    )
+    check(alerts == [], "_record_results: a new target's first success fires no 'answering again' alert")
+    fdb = FakeDB([{"state": "down", "consecutive_fails": 4}])
+    p._get_db = lambda: fdb
+    p._record_results(by_id, {7: (True, 4, "")})
+    check(alerts == [(7, "up")], "_record_results: a down target that answers still alerts")
+    alerts.clear()
+    fdb = FakeDB([{"state": "up", "consecutive_fails": 2}])
+    p._get_db = lambda: fdb
+    p._record_results(by_id, {7: (False, None, "no reply")})
+    check(alerts == [(7, "down")], "_record_results: crossing the failure threshold still alerts")
+
     # ── register(): the periodic tick is registered at Jen's real floor ─────
     # (the actual v1.0.1 bug: register_periodic(..., 1) is below Jen's
     # PERIODIC_MIN_MINUTES=5 and raises, so the plugin never loads at all —
