@@ -436,6 +436,29 @@ def main():
     p._record_results(by_id, {7: (False, None, "no reply")})
     check(alerts == [(7, "down")], "_record_results: crossing the failure threshold still alerts")
 
+    # ── 1.0.3: a database failure never reaches the page or the API ──────────
+    def db_down(*a, **k):
+        raise RuntimeError("Access denied for user 'jen'@'10.9.9.9' marker-q96")
+
+    flashed.clear()
+    p._can = everything
+    p._get_db = db_down
+    p.request = types.SimpleNamespace(
+        form={"ip": "10.1.0.9", "label": "x", "probe": "ping", "interval_min": "5", "fails_to_down": "3"}, args={}
+    )
+    p.add_target()
+    check(
+        flashed and all("marker-q96" not in m and "10.9.9.9" not in m for m in flashed) and "Jen's log" in flashed[-1],
+        f"add_target: a database failure shows a generic message and no exception text (got {flashed})",
+    )
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "k", "subnet_ids": None})
+    p.request = types.SimpleNamespace(get_json=lambda silent=True: {"ip": "10.1.0.7", "label": "x"})
+    result = p._api_add_target()
+    check(
+        isinstance(result, tuple) and result[1] == 500 and "marker-q96" not in str(result[0]),
+        f"_api_add_target: a database failure returns a generic 500, not the exception text (got {result})",
+    )
+
     # ── register(): the periodic tick is registered at Jen's real floor ─────
     # (the actual v1.0.1 bug: register_periodic(..., 1) is below Jen's
     # PERIODIC_MIN_MINUTES=5 and raises, so the plugin never loads at all —
