@@ -69,6 +69,69 @@ def _stub_jen_plugin_api(periodic_min_minutes=None):
     plugin_api.register_row_action = lambda *a, **k: None
     plugin_api.register_search_provider = lambda *a, **k: None
     plugin_api.api_key_required = lambda write=False: lambda fn: fn
+
+    def normalize_mac(raw):
+        import re as _re
+
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        cleaned = _re.sub(r"[^0-9a-fA-F]", "", raw).lower()
+        if len(cleaned) != 12:
+            return None
+        mac = ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
+        return mac if _re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", mac) else None
+
+    def like_pattern(text):
+        return "%" + str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+    def in_placeholders(values):
+        n = len(list(values))
+        return ",".join(["%s"] * n) if n else "NULL"
+
+    def search_scope(accessible_ids, all_subnets, column):
+        if all_subnets:
+            return "1=1", []
+        ids = sorted({int(i) for i in (accessible_ids or [])})
+        if not ids:
+            return None
+        return f"{column} IN ({in_placeholders(ids)})", ids
+
+    def json_object_body():
+        import sys as _sys
+
+        req = getattr(_sys.modules.get("flask"), "request", None)
+        try:
+            body = req.get_json(silent=True) if req is not None else None
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            return body, None
+        return None, ({"error": "expected a JSON object"}, 400)
+
+    def str_field(body, name, max_len=None):
+        value = body.get(name) if isinstance(body, dict) else None
+        if not isinstance(value, str):
+            return ""
+        value = value.strip()
+        return value[:max_len] if max_len is not None else value
+
+    def api_key_can_access_subnet(key, subnet_id, *, allow_unattributed=False):
+        if not key:
+            return False
+        scope = key.get("subnet_access")
+        if scope is None:
+            return True
+        if subnet_id is None:
+            return allow_unattributed
+        return subnet_id in scope
+
+    plugin_api.normalize_mac = normalize_mac
+    plugin_api.like_pattern = like_pattern
+    plugin_api.in_placeholders = in_placeholders
+    plugin_api.search_scope = search_scope
+    plugin_api.json_object_body = json_object_body
+    plugin_api.str_field = str_field
+    plugin_api.api_key_can_access_subnet = api_key_can_access_subnet
     if periodic_min_minutes is not None:
         plugin_api.PERIODIC_MIN_MINUTES = periodic_min_minutes
     jen_pkg.plugin_api = plugin_api
@@ -179,6 +242,8 @@ def main():
     check(p.derive_subnet_id("192.168.1.200", subnet_map) == 2, "derive_subnet_id: matches the second subnet")
     check(p.derive_subnet_id("172.16.0.1", subnet_map) is None, "derive_subnet_id: no match is None, not an error")
     check(p.derive_subnet_id("not-an-ip", subnet_map) is None, "derive_subnet_id: garbage IP is None, not an error")
+
+    _stub_jen_plugin_api()
 
     # ── MAC normalisation ────────────────────────────────────────────────────
     check(p._normalize_mac("AA:BB:CC:DD:EE:FF") == "aa:bb:cc:dd:ee:ff", "_normalize_mac: uppercase colon form")
@@ -380,12 +445,14 @@ def main():
     for label, ip in (("subnet 2", "10.2.0.7"), ("no subnet", "172.16.0.7")):
         fdb = FakeDB()
         p._get_db = lambda fdb=fdb: fdb
-        p.request = types.SimpleNamespace(get_json=lambda silent=True, ip=ip: {"ip": ip, "label": "x"})
+        sys.modules["flask"].request = types.SimpleNamespace(
+            get_json=lambda silent=True, ip=ip: {"ip": ip, "label": "x"}
+        )
         result = p._api_add_target()
         check(result[1] == 403 and fdb.statements == [], f"api add: a scoped key cannot add a target in {label}")
     fdb = FakeDB()
     p._get_db = lambda fdb=fdb: fdb
-    p.request = types.SimpleNamespace(get_json=lambda silent=True: {"ip": "10.1.0.7", "label": "x"})
+    sys.modules["flask"].request = types.SimpleNamespace(get_json=lambda silent=True: {"ip": "10.1.0.7", "label": "x"})
     result = p._api_add_target()
     check(
         isinstance(result, dict) and result.get("ok") is True and "INSERT" in fdb.kinds(),
@@ -452,12 +519,101 @@ def main():
         f"add_target: a database failure shows a generic message and no exception text (got {flashed})",
     )
     sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "k", "subnet_ids": None})
-    p.request = types.SimpleNamespace(get_json=lambda silent=True: {"ip": "10.1.0.7", "label": "x"})
+    sys.modules["flask"].request = types.SimpleNamespace(get_json=lambda silent=True: {"ip": "10.1.0.7", "label": "x"})
     result = p._api_add_target()
     check(
         isinstance(result, tuple) and result[1] == 500 and "marker-q96" not in str(result[0]),
         f"_api_add_target: a database failure returns a generic 500, not the exception text (got {result})",
     )
+
+    # ── 1.0.4: _load_target no longer 500s on a DB failure ───────────────────
+    p._get_db = db_down
+    row, why = p._load_target(1)
+    check(
+        row is None and "marker-q96" not in why and why,
+        f"_load_target: a database failure is a generic refusal, not an uncaught exception (got {row}, {why!r})",
+    )
+
+    # ── 1.0.4: add_target and the API refuse a second target for one IP ──────
+    p._can = everything
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}}
+    flashed.clear()
+    fdb = FakeDB(selects=[{"id": 1}])  # the duplicate-IP SELECT finds a row
+    p._get_db = lambda: fdb
+    p.request = types.SimpleNamespace(
+        form={"ip": "10.1.0.9", "label": "x", "probe": "ping", "interval_min": "5", "fails_to_down": "3"}, args={}
+    )
+    p.add_target()
+    check(
+        fdb.kinds() == ["SELECT"] and any("already" in m for m in flashed),
+        f"add_target: a duplicate IP is refused before any INSERT (got {fdb.kinds()}, {flashed})",
+    )
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "k", "subnet_ids": None})
+    sys.modules["flask"].request = types.SimpleNamespace(get_json=lambda silent=True: {"ip": "10.1.0.9", "label": "x"})
+    fdb = FakeDB(selects=[{"id": 1}])
+    p._get_db = lambda: fdb
+    result = p._api_add_target()
+    check(
+        isinstance(result, tuple) and result[1] == 409 and fdb.kinds() == ["SELECT"],
+        f"_api_add_target: a duplicate IP is a 409, not a silent second target (got {result}, {fdb.kinds()})",
+    )
+    sys.modules["flask"].request = types.SimpleNamespace(
+        get_json=lambda silent=True: {"ip": "10.1.0.9", "label": "x", "mac": 5}
+    )
+    result = p._api_add_target()
+    check(isinstance(result, tuple) and result[1] == 400, f"_api_add_target: a non-string mac is a 400 (got {result})")
+
+    # ── 1.0.4: _target_rows reads every target's uptime in ONE query ─────────
+    # a fresh module: the "results page" test earlier permanently replaced p._target_rows with a
+    # canned lambda, and the real one is what this checks.
+    fresh = load_plugin()
+    fdb = FakeDB(
+        selects=[
+            [{"id": 1, "label": "a"}, {"id": 2, "label": "b"}],  # the targets query
+            [{"target_id": 1, "ok": 1}, {"target_id": 1, "ok": 0}, {"target_id": 2, "ok": 1}],  # ALL checks, one query
+        ]
+    )
+    fresh._get_db = lambda: fdb
+    rows = fresh._target_rows()
+    check(
+        fdb.kinds() == ["SELECT", "SELECT"],
+        f"_target_rows: one query for the targets and ONE for every target's checks, not one per target (got {fdb.kinds()})",
+    )
+    by_id = {r["id"]: r for r in rows}
+    check(
+        by_id[1]["uptime_pct"] == 50 and by_id[2]["uptime_pct"] == 100,
+        f"_target_rows: each target's own checks feed its own uptime (got {by_id[1]['uptime_pct']}, {by_id[2]['uptime_pct']})",
+    )
+
+    # ── 1.0.4: an alert is sent only after the recording connection is closed ─
+    order = []
+    p._alert_transition = lambda target, new_state: order.append("alert")
+
+    class _ClosingDB(FakeDB):
+        def close(self):
+            order.append("close")
+
+    fdb = _ClosingDB(selects=[{"state": "up", "consecutive_fails": 0}])
+    p._get_db = lambda: fdb
+    p._record_results({1: {"id": 1, "ip": "10.1.0.1", "fails_to_down": 1}}, {1: (False, None, "timeout")})
+    check(
+        order == ["close", "alert"],
+        f"_record_results: the alert is sent after the connection closes, not inside the loop (got {order})",
+    )
+
+    # ── 1.0.4: the search provider scopes in SQL, before its own LIMIT ────────
+    fdb = FakeDB(selects=[[]])
+    p._get_db = lambda: fdb
+    p._watchdog_search("printer", {1}, False)
+    kind, sql, params = fdb.statements[0]
+    check(
+        "t.subnet_id IN (%s)" in sql and params[0] == 1,
+        f"search: the caller's own subnet scope is in the SQL, not applied afterward (got {sql!r}, {params})",
+    )
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    p._watchdog_search("printer", set(), False)
+    check(fdb.statements == [], "search: a caller who may see nothing runs no query at all")
 
     # ── register(): the periodic tick is registered at Jen's real floor ─────
     # (the actual v1.0.1 bug: register_periodic(..., 1) is below Jen's
