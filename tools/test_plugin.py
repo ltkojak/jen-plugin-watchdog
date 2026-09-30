@@ -615,6 +615,63 @@ def main():
     p._watchdog_search("printer", set(), False)
     check(fdb.statements == [], "search: a caller who may see nothing runs no query at all")
 
+    # ── 1.0.5: _tick() itself, end to end — the seam the real bug lived in ───
+    # (the actual v1.0.0-1.0.4 bug: the SELECT that feeds due_targets() never
+    # selected `enabled`, so every real row it fetched had no `enabled` key at
+    # all and due_targets()'s own "if not t.get('enabled'): continue" skipped
+    # every target unconditionally, forever — a hand-built dict carrying
+    # `enabled` explicitly, the way due_targets() itself was already tested,
+    # could never have caught it. This calls _tick() itself, never due_targets
+    # or _record_results in isolation.)
+    probed = []
+
+    def _fake_probe(t):
+        probed.append(t["id"])
+        return (True, 4, "")
+
+    p._probe_target = _fake_probe
+    p._alert_transition = lambda target, new_state: (_ for _ in ()).throw(
+        AssertionError("a brand-new target's first success must not alert")
+    )
+
+    target_row = {
+        "id": 1,
+        "ip": "10.1.0.5",
+        "probe": "ping",
+        "interval_min": 5,
+        "fails_to_down": 3,
+        "label": "tick-target",
+        "subnet_id": 1,
+        "mac": "",
+        "enabled": 1,
+    }
+    fdb = FakeDB(selects=[[target_row], [], None])
+    p._get_db = lambda: fdb
+    p._tick()
+    check(probed == [1], f"_tick: the enabled, due target actually reaches the probe pool (got {probed})")
+    kinds_and_sql = [(k, sql) for k, sql, _params in fdb.statements]
+    check(
+        any(k == "INSERT" and "wd_checks" in sql for k, sql in kinds_and_sql),
+        f"_tick: an enabled target gets a wd_checks row (got {fdb.kinds()})",
+    )
+    check(
+        any(k == "INSERT" and "wd_state" in sql for k, sql in kinds_and_sql),
+        f"_tick: a brand-new target also gets its first wd_state row (got {fdb.kinds()})",
+    )
+
+    # The real SQL's own WHERE enabled=1 means a disabled target is never even
+    # fetched — this is what that looks like from _tick()'s side: an empty
+    # targets result, same as an install with nothing enabled at all.
+    probed.clear()
+    fdb = FakeDB(selects=[[], []])
+    p._get_db = lambda: fdb
+    p._tick()
+    check(probed == [], "_tick: no targets fetched means no probe ever runs")
+    check(
+        all(k == "SELECT" for k in fdb.kinds()),
+        f"_tick: nothing is written when the enabled=1 query returns nothing (got {fdb.kinds()})",
+    )
+
     # ── register(): the periodic tick is registered at Jen's real floor ─────
     # (the actual v1.0.1 bug: register_periodic(..., 1) is below Jen's
     # PERIODIC_MIN_MINUTES=5 and raises, so the plugin never loads at all —
