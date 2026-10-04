@@ -68,6 +68,7 @@ def _stub_jen_plugin_api(periodic_min_minutes=None):
     plugin_api.register_alert_type = lambda *a, **k: None
     plugin_api.register_row_action = lambda *a, **k: None
     plugin_api.register_search_provider = lambda *a, **k: None
+    plugin_api.register_investigation_provider = lambda *a, **k: INVESTIGATION_CALLS.append((a, k))
     plugin_api.api_key_required = lambda write=False: lambda fn: fn
 
     def normalize_mac(raw):
@@ -149,6 +150,7 @@ def load_plugin():
 
 
 failures = []
+INVESTIGATION_CALLS = []  # every register_investigation_provider() call
 
 
 def check(cond, msg):
@@ -676,8 +678,111 @@ def main():
     # (the actual v1.0.1 bug: register_periodic(..., 1) is below Jen's
     # PERIODIC_MIN_MINUTES=5 and raises, so the plugin never loads at all —
     # this calls the real register(app) end to end, not just inspects source)
+    INVESTIGATION_CALLS.clear()
     calls_with_export = _stub_jen_plugin_api(periodic_min_minutes=7)
     p.register(_FakeApp())
+    check(
+        len(INVESTIGATION_CALLS) == 1
+        and INVESTIGATION_CALLS[0][0] == ("watchdog",)
+        and INVESTIGATION_CALLS[0][1]["fn"] is p._investigate,
+        "register(): exactly one investigation provider, the plugin's own",
+    )
+
+    # ── 1.1.0: the investigation provider ────────────────────────────────────
+    ns = types.SimpleNamespace
+    check(
+        p.subject_addresses(
+            ns(
+                ip="10.0.0.5",
+                leases4=[{"ip": "10.0.0.5"}, {"ip": "10.0.0.6"}, {"ip": "nope"}],
+                reservations=[{"ip": "10.0.0.7"}],
+            )
+        )
+        == ["10.0.0.5", "10.0.0.6", "10.0.0.7"],
+        "subject_addresses: the typed address, the leases and the reservations, validated and de-duplicated",
+    )
+    check(
+        p.subject_addresses(ns(ip="", leases4=None, reservations=None)) == [],
+        "subject_addresses: nothing known is an empty list",
+    )
+    check(p.investigation_card([]) is None, "investigation_card: a client with no target adds no card")
+    import datetime as _dt
+
+    when = _dt.datetime(2026, 10, 1, 8, 30)
+    up = {
+        "ip": "10.0.0.5", "label": "printer", "state": "up", "since": when, "last_ok_at": when, "last_fail_at": None,
+        "consecutive_fails": 0, "last_error": None, "probe": "ping", "enabled": 1,
+    }  # fmt: skip
+    card = p.investigation_card([up])
+    check(
+        card["status"] == "ok" and card["summary"] == "printer is answering (up since 2026-10-01 08:30 UTC)",
+        f"investigation_card: an up target is an ok card (got {card['summary']!r})",
+    )
+    down = dict(up, state="down", consecutive_fails=3, last_fail_at=when, last_error="no answer")
+    card = p.investigation_card([up, down])
+    check(
+        card["status"] == "warn"
+        and card["summary"].startswith("printer is down since 2026-10-01 08:30 UTC (3 failed checks in a row)"),
+        f"investigation_card: a down target makes it a warn card and is listed first (got {card['summary']!r})",
+    )
+    check(
+        {"label": "Last error", "value": "no answer"} in card["rows"],
+        "investigation_card: a down target shows its last error",
+    )
+    paused = p.investigation_card([dict(down, enabled=0)])
+    check(
+        paused["status"] == "ok" and "paused" in paused["summary"],
+        "investigation_card: a paused target is not a warning, however its state reads",
+    )
+    check(
+        "no result yet" in p.investigation_card([dict(up, state=None, since=None)])["summary"],
+        "investigation_card: a target with no result yet says so",
+    )
+    check(
+        len(
+            [
+                r
+                for r in p.investigation_card([dict(up, ip=f"10.0.0.{i}", label=f"t{i}") for i in range(20)])["rows"]
+                if r["label"] == "Probe"
+            ]
+        )
+        == p._INVESTIGATION_MAX_TARGETS,
+        "investigation_card: capped at five targets",
+    )
+
+    # the impure provider, end to end through the plugin's own query
+    subject = ns(mac="AA:BB:CC:DD:EE:01", ip="10.0.0.5", leases4=[{"ip": "10.0.0.5"}], reservations=[])
+    fdb = FakeDB(selects=[[dict(up)]])
+    p._get_db = lambda: fdb
+    got = p._investigate(subject, {1}, False)
+    kind, sql, params = fdb.statements[0]
+    check(
+        got is not None and got["href"] == "/network/watchdog" and "printer" in got["summary"],
+        f"_investigate: the card for a seeded client, linking to the plugin's own page (got {got})",
+    )
+    check(
+        "t.subnet_id IN (%s)" in sql
+        and "t.mac=%s" in sql
+        and "t.ip IN (%s)" in sql
+        and params == (1, "aa:bb:cc:dd:ee:01", "10.0.0.5"),
+        f"_investigate: the caller's scope, the MAC and the address are all in the one parameterised query (got {sql!r}, {params})",
+    )
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    check(
+        p._investigate(subject, set(), False) is None and fdb.statements == [],
+        "_investigate: a caller who may see no subnet runs no query at all",
+    )
+    fdb = FakeDB(selects=[[]])
+    p._get_db = lambda: fdb
+    check(p._investigate(subject, None, True) is None, "_investigate: an unknown client gets None")
+    check("1=1" in fdb.statements[0][1], "_investigate: an unrestricted caller's scope is 1=1")
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    check(
+        p._investigate(ns(mac="", ip="", leases4=[], reservations=[]), None, True) is None and fdb.statements == [],
+        "_investigate: a subject with no MAC and no address runs no query",
+    )
     tick_calls = [c for c in calls_with_export if c[1] == "probe-tick"]
     check(
         len(tick_calls) == 1 and tick_calls[0][3] == 7,
