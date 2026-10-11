@@ -801,6 +801,78 @@ def main():
         "register_periodic is never called below 5 — Jen's own PERIODIC_MIN_MINUTES floor",
     )
 
+    # ── 1.1.1: an alert about a target in no Kea subnet is `scoped=True`, and only that one ──
+    _stub_jen_plugin_api()
+    sent_alerts = []
+    sys.modules["jen.plugin_api"].send_alert = lambda alert_type, **kw: sent_alerts.append((alert_type, kw))
+    sys.modules["jen.plugin_api"].emit = lambda *a, **k: None
+    q = load_plugin()  # an untouched copy: p._alert_transition was replaced by a recorder above
+    q._subnet_map = lambda: {1: {"name": "A", "cidr": "10.1.0.0/24"}}
+    for label, subnet_id, expect_scoped in (
+        ("a target in a Kea subnet", 1, False),
+        ("a target in no Kea subnet", None, True),
+    ):
+        for state, kind in (("down", "watchdog_down"), ("up", "watchdog_up")):
+            sent_alerts.clear()
+            q._alert_transition({"id": 3, "ip": "10.1.0.5", "label": "nas", "subnet_id": subnet_id}, state)
+            ok = (
+                len(sent_alerts) == 1
+                and sent_alerts[0][0] == kind
+                and sent_alerts[0][1]["subnet_id"] == subnet_id
+                and bool(sent_alerts[0][1].get("scoped", False)) is expect_scoped
+                and ("scoped" in sent_alerts[0][1]) is expect_scoped
+            )
+            check(ok, f"_alert_transition ({state}): {label} is sent with scoped={expect_scoped} (got {sent_alerts})")
+
+    # ── 1.1.1: ONE refusal for an address the caller may not add - in a Kea subnet they cannot see, or in no Kea subnet at all ──
+    check(
+        p.ADDRESS_REFUSAL == "That address is not in a subnet you can access.",
+        "ADDRESS_REFUSAL: the one sentence, which does not say whether the address is in a Kea subnet",
+    )
+    p._can = only_one
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    p._require_write = lambda: True
+    refusals = {}
+    for label, ip in (("an address in subnet 2", "10.2.0.9"), ("an address in no Kea subnet", "172.16.0.9")):
+        fdb = FakeDB()
+        p._get_db = lambda fdb=fdb: fdb
+        flashed.clear()
+        p.request = types.SimpleNamespace(
+            form={"ip": ip, "label": "x", "probe": "ping", "interval_min": "5", "fails_to_down": "3"}, args={}
+        )
+        p.add_target()
+        refusals[label] = list(flashed)
+        check(
+            flashed == [p.ADDRESS_REFUSAL] and fdb.statements == [],
+            f"add_target: {label} - refused with the one sentence, nothing written (got {flashed})",
+        )
+    check(
+        len({tuple(v) for v in refusals.values()}) == 1,
+        f"add_target: the two refusals are the very same text, so neither tells whether the address is in a Kea subnet (got {refusals})",
+    )
+    for label, ip in (("an address in subnet 2", "10.2.0.9"), ("an address in no Kea subnet", "172.16.0.9")):
+        fdb = FakeDB()
+        p._get_db = lambda fdb=fdb: fdb
+        flashed.clear()
+        p.request = types.SimpleNamespace(args={"ip": ip, "mac": "", "hostname": "h"})
+        p.watch_from_row()
+        check(
+            flashed == [p.ADDRESS_REFUSAL] and fdb.statements == [],
+            f"watch_from_row: {label} - the same sentence, nothing written (got {flashed})",
+        )
+    fdb = FakeDB([None])
+    p._get_db = lambda fdb=fdb: fdb
+    flashed.clear()
+    p.request = types.SimpleNamespace(
+        form={"ip": "10.1.0.9", "label": "x", "probe": "ping", "interval_min": "5", "fails_to_down": "3"}, args={}
+    )
+    p.add_target()
+    check(
+        "INSERT" in fdb.kinds() and p.ADDRESS_REFUSAL not in flashed,
+        f"add_target: the control - an address in the caller's own subnet is still added (got {fdb.kinds()}, {flashed})",
+    )
+    p.request = None
+
     if failures:
         print(f"\n{len(failures)} check(s) failed")
         return 1
