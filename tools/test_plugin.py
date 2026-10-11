@@ -603,6 +603,108 @@ def main():
         f"_record_results: the alert is sent after the connection closes, not inside the loop (got {order})",
     )
 
+    # ── 1.1.2: an alert only for a transition that was STORED ─────────────────
+    # The real _record_results against a transactional fake: statements are pending until commit() and are discarded by
+    # rollback()/close() (the server's own rollback on a connection that never committed), so "state unchanged" is
+    # asserted on what a later reader would actually find, not on whether the code reached a line.
+    events = []
+    sent = []
+
+    class TxDB(FakeDB):
+        def __init__(self, selects=None, break_on_insert=None):
+            super().__init__(selects)
+            self.pending = []
+            self.committed = []
+            self.insert_checks = 0
+            self.break_on_insert = break_on_insert  # the Nth INSERT INTO wd_checks raises
+
+        def execute(self, sql, params=()):
+            if sql.lstrip().upper().startswith("INSERT INTO WD_CHECKS"):
+                self.insert_checks += 1
+                if self.break_on_insert == self.insert_checks:
+                    raise RuntimeError("Lock wait timeout exceeded")
+            super().execute(sql, params)
+            words = sql.split()
+            kind = words[0].upper()
+            if kind in ("INSERT", "UPDATE", "DELETE"):  # a write: held until commit
+                self.pending.append(f"{kind} {words[1] if kind == 'UPDATE' else words[2]}")
+
+        def commit(self):
+            events.append("commit")
+            self.committed.extend(self.pending)
+            self.pending = []
+
+        def rollback(self):
+            events.append("rollback")
+            self.pending = []
+
+        def close(self):
+            events.append("close")
+            self.pending = []  # whatever was never committed is gone
+
+    p._alert_transition = lambda target, new_state: (sent.append((target["id"], new_state)), events.append("alert"))
+    two = {7: {"id": 7, "ip": "10.1.0.7", "fails_to_down": 3}, 8: {"id": 8, "ip": "10.1.0.8", "fails_to_down": 3}}
+    both = {7: (False, None, "no reply"), 8: (True, 3, "")}
+    # target 7 is up with two failures behind it: this failed check crosses its threshold (a transition to alert);
+    # target 8 is a brand-new target whose first check succeeds (stored, no alert)
+    rows = [{"state": "up", "consecutive_fails": 2}, None]
+
+    broken = TxDB(
+        selects=list(rows), break_on_insert=2
+    )  # target 8's wd_checks INSERT fails after 7's state was written
+    p._get_db = lambda: broken
+    p._record_results(two, both)
+    check(
+        sent == [],
+        f"_record_results: an INSERT that fails sends no alert, even for the target recorded before it (got {sent})",
+    )
+    check(
+        broken.committed == [] and broken.pending == [],
+        f"_record_results: an INSERT that fails leaves nothing stored (committed {broken.committed})",
+    )
+    check(
+        "commit" not in events and events[:2] == ["rollback", "close"],
+        f"_record_results: a failed recording rolls back, closes and never commits (got {events})",
+    )
+
+    events.clear()
+    working = TxDB(selects=list(rows))  # the next tick: the database answers, the same transition is found again
+    p._get_db = lambda: working
+    p._record_results(two, both)
+    check(
+        sent == [(7, "down")],
+        f"_record_results: the next tick sends exactly one alert, for the transition (got {sent})",
+    )
+    check(
+        events == ["commit", "close", "alert"],
+        f"_record_results: the alert follows the commit and the close, in that order (got {events})",
+    )
+    check(
+        "UPDATE wd_state" in working.committed and "INSERT wd_state" in working.committed,
+        f"_record_results: both targets' state was committed (got {working.committed})",
+    )
+
+    # a commit that itself fails is the same refusal: nothing was stored, so nothing is announced
+    class CommitFails(TxDB):
+        def commit(self):
+            events.append("commit")
+            raise RuntimeError("server has gone away")
+
+    events.clear()
+    sent.clear()
+    failing_commit = CommitFails(selects=list(rows))
+    p._get_db = lambda: failing_commit
+    p._record_results(two, both)
+    check(sent == [], f"_record_results: a commit that fails sends no alert (got {sent})")
+
+    # a second transition-free tick sends nothing: the alert is not repeated once it was stored and sent
+    events.clear()
+    sent.clear()
+    settled = TxDB(selects=[{"state": "down", "consecutive_fails": 3}, {"state": "up", "consecutive_fails": 0}])
+    p._get_db = lambda: settled
+    p._record_results(two, {7: (False, None, "no reply"), 8: (True, 3, "")})
+    check(sent == [], f"_record_results: a target that stays down does not alert again (got {sent})")
+
     # ── 1.0.4: the search provider scopes in SQL, before its own LIMIT ────────
     fdb = FakeDB(selects=[[]])
     p._get_db = lambda: fdb
