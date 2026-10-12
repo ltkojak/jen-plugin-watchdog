@@ -9,8 +9,10 @@ plugin with hand-built inputs.
 Run: `python3 tools/test_plugin.py` (exit 1 on the first failing check).
 """
 
+import functools
 import importlib.util
 import os
+import pathlib
 import sys
 import types
 
@@ -48,6 +50,50 @@ def _stub_modules():
 class _FakeApp:
     def register_blueprint(self, bp):
         pass
+
+
+# The role gate the real jen.plugin_api provides (`is_admin_or_above`, `require_write`), reading the
+# stub current_user's role LIVE so a check can flip it. plugin.py imports both at the top, so they
+# must exist before it is loaded. A refusal is recorded (message, endpoint) and the route is not run,
+# which is what the real decorator does for a page request: flash, redirect, never touch the request.
+GATE_REFUSALS = []
+
+
+def _gate_is_admin_or_above():
+    return getattr(sys.modules["flask_login"].current_user, "role", None) in ("superadmin", "admin")
+
+
+def _gate_is_superadmin():
+    return getattr(sys.modules["flask_login"].current_user, "role", None) == "superadmin"
+
+
+def _gate_require_write(message="Viewers can look at this but not change it.", redirect_endpoint="dashboard.dashboard"):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapped(*a, **k):
+            if _gate_is_admin_or_above():
+                return fn(*a, **k)
+            GATE_REFUSALS.append((message, redirect_endpoint))
+            return "refused"
+
+        return wrapped
+
+    return deco
+
+
+def _install_gate_api(plugin_api=None):
+    """Put the gate functions on the stub jen.plugin_api (creating the stub package when none exists yet)."""
+    if plugin_api is None:
+        plugin_api = sys.modules.get("jen.plugin_api")
+        if plugin_api is None:
+            jen_pkg = types.ModuleType("jen")
+            plugin_api = types.ModuleType("jen.plugin_api")
+            jen_pkg.plugin_api = plugin_api
+            sys.modules["jen"] = jen_pkg
+            sys.modules["jen.plugin_api"] = plugin_api
+    plugin_api.is_admin_or_above = _gate_is_admin_or_above
+    plugin_api.is_superadmin = _gate_is_superadmin
+    plugin_api.require_write = _gate_require_write
 
 
 def _stub_jen_plugin_api(periodic_min_minutes=None):
@@ -133,6 +179,7 @@ def _stub_jen_plugin_api(periodic_min_minutes=None):
     plugin_api.json_object_body = json_object_body
     plugin_api.str_field = str_field
     plugin_api.api_key_can_access_subnet = api_key_can_access_subnet
+    _install_gate_api(plugin_api)
     if periodic_min_minutes is not None:
         plugin_api.PERIODIC_MIN_MINUTES = periodic_min_minutes
     jen_pkg.plugin_api = plugin_api
@@ -143,6 +190,7 @@ def _stub_jen_plugin_api(periodic_min_minutes=None):
 
 def load_plugin():
     _stub_modules()
+    _install_gate_api()
     spec = importlib.util.spec_from_file_location("watchdog_plugin", os.path.join(ROOT, "plugin.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -255,25 +303,41 @@ def main():
 
     # ── write gate — viewers can look at Watchdog but not change it ─────────
     p.current_user.role = "viewer"
-    check(p._is_admin() is False, "a viewer is not admin")
-    check(p._require_write() is False, "a viewer cannot write")
+    check(p.is_admin_or_above() is False, "a viewer is not admin")
     # request is None in this harness; a route that reaches request.form/
-    # request.args raises AttributeError, so returning None without raising
-    # proves _require_write() stopped it first.
+    # request.args raises AttributeError, so returning "refused" without raising
+    # proves the require_write decorator stopped it first, with the plugin's own sentence and index page.
     for fn, args in (
         (p.add_target, ()),
         (p.toggle_target, (1,)),
         (p.delete_target, (1,)),
         (p.watch_from_row, ()),
     ):
+        del GATE_REFUSALS[:]
         try:
-            fn(*args)
-            gated = True
+            got = fn(*args)
+            gated = got == "refused"
         except Exception:
             gated = False
         check(gated, f"{fn.__name__} refuses a viewer before touching the request")
+        check(
+            GATE_REFUSALS == [("Viewers can look at Watchdog but not change it.", "watchdog.index")],
+            f"{fn.__name__}: the viewer is told the plugin's own sentence and sent to the Watchdog page (got {GATE_REFUSALS})",
+        )
     p.current_user.role = "admin"
-    check(p._is_admin() is True, "admin role restored for the rest of the run")
+    check(p.is_admin_or_above() is True, "admin role restored for the rest of the run")
+    check(
+        all(
+            fn.__name__ == fn.__wrapped__.__name__
+            for fn in (p.add_target, p.toggle_target, p.delete_target, p.watch_from_row)
+        ),
+        "the four write routes carry the plugin_api require_write decorator (functools.wraps)",
+    )
+    src = pathlib.Path(ROOT, "plugin.py").read_text(encoding="utf-8")
+    check(
+        "def _is_admin" not in src and "def _require_write" not in src,
+        "plugin.py no longer carries its own copies of the admin check or the write gate",
+    )
 
     # ── 1.0.2: the first result of a new target is not an alert ─────────────
     check(
@@ -331,7 +395,6 @@ def main():
     p.redirect = lambda where: "redirect"
     p.url_for = lambda *a, **k: "/"
     p.jsonify = lambda payload: payload
-    p._require_write = lambda: True
 
     # ── 1.0.2: by-id routes judge the row's OWN subnet ──────────────────────
     for label, row_subnet in (("a target in subnet 2", 2), ("a target in no subnet", None)):
@@ -933,7 +996,6 @@ def main():
     )
     p._can = only_one
     p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
-    p._require_write = lambda: True
     refusals = {}
     for label, ip in (("an address in subnet 2", "10.2.0.9"), ("an address in no Kea subnet", "172.16.0.9")):
         fdb = FakeDB()
@@ -974,6 +1036,71 @@ def main():
         f"add_target: the control - an address in the caller's own subnet is still added (got {fdb.kinds()}, {flashed})",
     )
     p.request = None
+
+    # ── 1.1.3: a probe that cannot fit its VARCHAR(40) column is refused with one precise sentence ──────────────────
+    long_probe = "tcp:" + ",".join(str(8000 + i) for i in range(8))  # 4 + 8*4 + 7 = 43 characters
+    fits_probe = "tcp:" + ",".join(str(8000 + i) for i in range(7))  # 4 + 7*4 + 6 = 38 characters
+    check(len(long_probe) == 43 and len(fits_probe) == 38, "the two probe fixtures are 43 and 38 characters")
+    kind, err = p.parse_probe(long_probe)
+    check(
+        kind is None and err == "That probe is 43 characters long and a probe holds at most 40 - list fewer ports.",
+        f"parse_probe: a 43-character probe is refused with the length sentence (got {kind!r}, {err!r})",
+    )
+    check(p.parse_probe(fits_probe)[0] == "tcp", "parse_probe: a 38-character probe is accepted")
+    check(
+        p.parse_probe("tcp:65536")[1] == "Invalid port(s): [65536]",
+        "parse_probe: a port above 65535 keeps its own sentence",
+    )
+    check(p.parse_probe("tcp:0")[1] == "Invalid port(s): [0]", "parse_probe: port 0 keeps its own sentence")
+    check(p.parse_probe("tcp:65535") == ("tcp", [65535]), "parse_probe: port 65535 is the last valid one")
+    fdb = FakeDB()
+    p._get_db = lambda fdb=fdb: fdb
+    p._can = everything
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}}
+    flashed.clear()
+    p.request = types.SimpleNamespace(
+        form={"ip": "10.1.0.9", "label": "x", "probe": long_probe, "interval_min": "5", "fails_to_down": "3"}, args={}
+    )
+    p.add_target()
+    check(
+        flashed == [err] and fdb.statements == [],
+        f"add_target: a probe too long for its column is refused before any statement runs (got {flashed}, {fdb.kinds()})",
+    )
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"name": "k"})
+    p.request = types.SimpleNamespace(get_json=lambda silent=True: {"ip": "10.1.0.9", "probe": long_probe})
+    sys.modules["flask"].request = p.request
+    got = p._api_add_target()
+    check(
+        got == ({"error": err}, 400) or (isinstance(got, tuple) and got[1:] == (400,)),
+        f"_api_add_target: the same too-long probe is a 400 with the same sentence (got {got})",
+    )
+    check(fdb.statements == [], "_api_add_target: nothing was written for the too-long probe")
+    sys.modules["flask"].request = None
+    p.request = None
+
+    # ── 1.1.3: the row action no longer sends a subnet_id the route never read ───────────────────────────────────────
+    row_action_calls = []
+    _stub_jen_plugin_api()
+    sys.modules["jen.plugin_api"].register_row_action = lambda *a, **k: row_action_calls.append(k)
+    p.register(_FakeApp())
+    check(
+        len(row_action_calls) == 1
+        and "subnet_id" not in row_action_calls[0]["href"]
+        and "{ip}" in row_action_calls[0]["href"],
+        f"register(): the Watch row action's link carries the address, not a subnet_id (got {row_action_calls})",
+    )
+    check(
+        'request.args.get("subnet_id"' not in src,
+        "plugin.py never reads a subnet_id from the query string (the subnet is derived from the address)",
+    )
+
+    # ── 1.1.3: every row that names a host carries the Investigate action (Jen's macro) ──────────────────────────────
+    page = pathlib.Path(ROOT, "templates", "watchdog", "index.html").read_text(encoding="utf-8")
+    check(
+        "{% from '_investigate.html' import investigate_link %}" in page
+        and 'investigate_link(r.mac or r.ip, "icon")' in page,
+        "index.html: each target row carries Jen's Investigate macro, given the MAC or else the address",
+    )
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")
