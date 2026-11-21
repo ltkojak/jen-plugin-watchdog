@@ -62,6 +62,7 @@
             {% if r.state == 'up' %}<span class="ok">{{ icon("circle-check") }} Up</span>
             {% elif r.state == 'down' %}<span class="bad">{{ icon("circle-x") }} Down</span>
             {% else %}<span class="muted">{{ icon("circle") }} Unknown</span>{% endif %}
+            {% if r.enabled and r.last_error and r.last_error.startswith('could not probe') %}<div class="small warn" data-wd-note="could-not-probe">{{ r.last_error }}</div>{% endif %}
         </td>
         <td data-m="hide">{{ r.subnet_name }}</td>
         <td class="small muted" data-m="hide">{{ r.last_ok_at | utcfmt if r.last_ok_at else '—' }}</td>
@@ -131,6 +132,7 @@
             <div class="form-group wd-hidden" id="wd-tcp-ports-group">
                 <label>Port(s)</label>
                 <input type="text" id="wd-tcp-ports" placeholder="80,443" autocomplete="off">
+                <div class="field-note" id="wd-port-note" role="alert" hidden></div>
             </div>
         </div>
         <div class="form-row">
@@ -204,7 +206,9 @@ document.getElementById('wd-add-form').addEventListener('submit', function(e) {
     var probeSelect = document.getElementById('wd-probe-select');
     if (probeSelect.value === 'tcp') {
         var ports = document.getElementById('wd-tcp-ports').value.trim();
-        if (!ports) { e.preventDefault(); alert('Enter at least one port.'); return; }
+        var portNote = document.getElementById('wd-port-note');
+        portNote.hidden = !!ports;
+        if (!ports) { e.preventDefault(); portNote.textContent = 'Enter at least one port.'; return; }
         var hidden = document.createElement('input');
         hidden.type = 'hidden';
         hidden.name = 'probe';

@@ -552,20 +552,22 @@ def main():
     by_id = {7: {"id": 7, "fails_to_down": 3}}
     fdb = FakeDB([None])  # no wd_state row yet: a brand-new target
     p._get_db = lambda: fdb
-    p._record_results(by_id, {7: (True, 4, "")})
+    p._record_results(by_id, {7: (True, 4, "")}, now)
     check(
-        "UTC_TIMESTAMP()" in fdb.statements[0][1] and "checked_at" in fdb.statements[0][1],
-        "_record_results: checked_at is written with UTC_TIMESTAMP(), like every other time in the table",
+        "checked_at" in fdb.statements[0][1]
+        and "UTC_TIMESTAMP" not in fdb.statements[0][1]
+        and fdb.statements[0][2][1] == now,
+        "_record_results: checked_at is the start of the tick it was given, never the database clock at record time",
     )
     check(alerts == [], "_record_results: a new target's first success fires no 'answering again' alert")
     fdb = FakeDB([{"state": "down", "consecutive_fails": 4}])
     p._get_db = lambda: fdb
-    p._record_results(by_id, {7: (True, 4, "")})
+    p._record_results(by_id, {7: (True, 4, "")}, now)
     check(alerts == [(7, "up")], "_record_results: a down target that answers still alerts")
     alerts.clear()
     fdb = FakeDB([{"state": "up", "consecutive_fails": 2}])
     p._get_db = lambda: fdb
-    p._record_results(by_id, {7: (False, None, "no reply")})
+    p._record_results(by_id, {7: (False, None, "no reply")}, now)
     check(alerts == [(7, "down")], "_record_results: crossing the failure threshold still alerts")
 
     # ── 1.0.3: a database failure never reaches the page or the API ──────────
@@ -660,7 +662,7 @@ def main():
 
     fdb = _ClosingDB(selects=[{"state": "up", "consecutive_fails": 0}])
     p._get_db = lambda: fdb
-    p._record_results({1: {"id": 1, "ip": "10.1.0.1", "fails_to_down": 1}}, {1: (False, None, "timeout")})
+    p._record_results({1: {"id": 1, "ip": "10.1.0.1", "fails_to_down": 1}}, {1: (False, None, "timeout")}, now)
     check(
         order == ["close", "alert"],
         f"_record_results: the alert is sent after the connection closes, not inside the loop (got {order})",
@@ -716,7 +718,7 @@ def main():
         selects=list(rows), break_on_insert=2
     )  # target 8's wd_checks INSERT fails after 7's state was written
     p._get_db = lambda: broken
-    p._record_results(two, both)
+    p._record_results(two, both, now)
     check(
         sent == [],
         f"_record_results: an INSERT that fails sends no alert, even for the target recorded before it (got {sent})",
@@ -733,7 +735,7 @@ def main():
     events.clear()
     working = TxDB(selects=list(rows))  # the next tick: the database answers, the same transition is found again
     p._get_db = lambda: working
-    p._record_results(two, both)
+    p._record_results(two, both, now)
     check(
         sent == [(7, "down")],
         f"_record_results: the next tick sends exactly one alert, for the transition (got {sent})",
@@ -757,7 +759,7 @@ def main():
     sent.clear()
     failing_commit = CommitFails(selects=list(rows))
     p._get_db = lambda: failing_commit
-    p._record_results(two, both)
+    p._record_results(two, both, now)
     check(sent == [], f"_record_results: a commit that fails sends no alert (got {sent})")
 
     # a second transition-free tick sends nothing: the alert is not repeated once it was stored and sent
@@ -765,7 +767,7 @@ def main():
     sent.clear()
     settled = TxDB(selects=[{"state": "down", "consecutive_fails": 3}, {"state": "up", "consecutive_fails": 0}])
     p._get_db = lambda: settled
-    p._record_results(two, {7: (False, None, "no reply"), 8: (True, 3, "")})
+    p._record_results(two, {7: (False, None, "no reply"), 8: (True, 3, "")}, now)
     check(sent == [], f"_record_results: a target that stays down does not alert again (got {sent})")
 
     # ── 1.0.4: the search provider scopes in SQL, before its own LIMIT ────────
@@ -1100,6 +1102,272 @@ def main():
         "{% from '_investigate.html' import investigate_link %}" in page
         and 'investigate_link(r.mac or r.ip, "icon")' in page,
         "index.html: each target row carries Jen's Investigate macro, given the MAC or else the address",
+    )
+
+    # ── 1.1.4 (WD-1): a 5-minute target is checked on EVERY tick, however long the run before it took ────────────────
+    q = load_plugin()
+    base = datetime(2026, 11, 20, 12, 0, 0)
+    five = [{"id": 1, "interval_min": 5, "enabled": True}, {"id": 2, "interval_min": 15, "enabled": True}]
+    check(
+        q.due_targets(five, {1: base - timedelta(seconds=299.9), 2: base - timedelta(minutes=14, seconds=59)}, base)
+        == [1, 2],
+        "due_targets: a check a fraction of a second younger than its interval is due (the tick's own jitter)",
+    )
+    check(
+        q.due_targets(five, {1: base - timedelta(seconds=200), 2: base - timedelta(minutes=10)}, base) == [],
+        "due_targets: a check well inside its interval is still not due",
+    )
+
+    class _Clock:
+        """Stands in for `datetime` inside the plugin: `now()` is whatever the test set."""
+
+        at = base
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.at.replace(tzinfo=tz)
+
+    class _Store:
+        """A database that KEEPS what _record_results writes, so a second tick reads the first one's check."""
+
+        def __init__(self, targets):
+            self.targets = targets
+            self.checks = []  # (target_id, checked_at, ok)
+            self.state = {}  # target_id -> {"state", "consecutive_fails", "last_error"}
+            self._answer = None
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=()):
+            if sql.startswith("SELECT id, ip, probe"):
+                self._answer = [dict(t) for t in self.targets]
+            elif "MAX(checked_at)" in sql:
+                last = {}
+                for tid, at, _ok in self.checks:
+                    last[tid] = max(at, last.get(tid, at))
+                self._answer = [{"target_id": tid, "last": at} for tid, at in last.items()]
+            elif sql.startswith("INSERT INTO wd_checks"):
+                self.checks.append((params[0], params[1], params[2]))
+            elif sql.startswith("SELECT state"):
+                row = self.state.get(params[0])
+                self._answer = dict(row) if row else None
+            elif sql.startswith("UPDATE wd_state SET last_error"):
+                self.state[params[1]]["last_error"] = params[0]
+            elif sql.startswith("UPDATE wd_state"):
+                self.state[params[-1]].update(state=params[0], consecutive_fails=params[1], last_error=params[4])
+            elif sql.startswith("INSERT INTO wd_state (target_id, state, consecutive_fails, since, last_error)"):
+                self.state[params[0]] = {"state": "unknown", "consecutive_fails": 0, "last_error": params[1]}
+            elif sql.startswith("INSERT INTO wd_state"):
+                self.state[params[0]] = {"state": params[1], "consecutive_fails": params[2], "last_error": params[5]}
+            elif sql.startswith("DELETE FROM wd_checks"):
+                pass
+            else:
+                raise AssertionError(f"a statement the store does not know: {sql}")
+            return 1
+
+        def fetchall(self):
+            return self._answer or []
+
+        def fetchone(self):
+            return self._answer
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    def _slow_dead_host(t):
+        _Clock.at += timedelta(seconds=1.2)  # `ping -W 1` on a host that does not answer
+        return (False, None, "no reply")
+
+    store = _Store(
+        [
+            {
+                "id": 1,
+                "ip": "10.1.0.5",
+                "probe": "ping",
+                "interval_min": 5,
+                "fails_to_down": 3,
+                "label": "nas",
+                "subnet_id": 1,
+                "mac": "",
+                "enabled": 1,
+            }
+        ]
+    )
+    went_down = []
+    q.datetime = _Clock
+    q._get_db = lambda: store
+    q._probe_target = _slow_dead_host
+    q._alert_transition = lambda target, state: went_down.append((_Clock.at - base).total_seconds())
+    for tick in range(4):
+        _Clock.at = base + timedelta(seconds=300 * tick)
+        q._tick()
+    check(
+        [(at - base).total_seconds() for _tid, at, _ok in store.checks] == [0.0, 300.0, 600.0, 900.0],
+        f"_tick: a 5-minute target that does not answer is checked on every tick (got {[(at - base).total_seconds() for _t, at, _o in store.checks]})",
+    )
+    check(
+        len(went_down) == 1 and went_down[0] < 700,
+        f"_tick: three failures in a row are the third tick, ten minutes after the first, not twenty (alert at {went_down})",
+    )
+
+    # ── 1.1.4 (WD-2): a probe that could not be MADE is not a host that did not answer ────────────────────────────────
+    w = load_plugin()
+    ping_target = {"ip": "10.1.0.5", "probe": "ping"}
+
+    def _no_ping(*a, **k):
+        raise FileNotFoundError(2, "No such file or directory", "ping")
+
+    w.subprocess = types.SimpleNamespace(run=_no_ping)
+    got = w._probe_target(ping_target)
+    check(
+        got[0] is None and got[2].startswith(w.COULD_NOT_PROBE + ": ping could not be run"),
+        f"_probe_target: no ping on this host is 'could not probe', not a failure (got {got})",
+    )
+    w.subprocess = types.SimpleNamespace(
+        run=lambda *a, **k: types.SimpleNamespace(
+            returncode=2, stdout="", stderr="ping: socket: Operation not permitted\n"
+        )
+    )
+    got = w._probe_target(ping_target)
+    check(
+        got == (None, None, "could not probe: ping: socket: Operation not permitted"),
+        f"_probe_target: ping's own error (exit 2) is 'could not probe' with ping's sentence (got {got})",
+    )
+    w.subprocess = types.SimpleNamespace(run=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr=""))
+    check(
+        w._probe_target(ping_target) == (False, None, "no reply"), "_probe_target: no reply (exit 1) is still a failure"
+    )
+    w.subprocess = types.SimpleNamespace(
+        run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="64 bytes from 10.1.0.5: time=0.5 ms", stderr="")
+    )
+    check(w._probe_target(ping_target) == (True, 0.5, ""), "_probe_target: a reply (exit 0) is still a success")
+
+    import errno as _errno
+
+    def _out_of_descriptors(*a, **k):
+        raise OSError(_errno.EMFILE, "Too many open files")
+
+    def _refused(*a, **k):
+        raise ConnectionRefusedError(_errno.ECONNREFUSED, "Connection refused")
+
+    tcp_target = {"ip": "10.1.0.5", "probe": "tcp:22"}
+    w.socket = types.SimpleNamespace(create_connection=_out_of_descriptors)
+    got = w._probe_target(tcp_target)
+    check(
+        got == (None, None, "could not probe: Too many open files"),
+        f"_probe_target: this process out of descriptors is 'could not probe' (got {got})",
+    )
+    w.socket = types.SimpleNamespace(create_connection=_refused)
+    got = w._probe_target(tcp_target)
+    check(
+        got[0] is False and "Connection refused" in got[2],
+        f"_probe_target: a refused port is still a failure (got {got})",
+    )
+
+    store = _Store([])
+    store.state[7] = {"state": "up", "consecutive_fails": 2, "last_error": ""}
+    sent = []
+    w._get_db = lambda: store
+    w._alert_transition = lambda target, state: sent.append(state)
+    for _ in range(5):
+        w._record_results(
+            {7: {"id": 7, "fails_to_down": 3}}, {7: (None, None, "could not probe: ping could not be run")}, base
+        )
+    check(
+        store.checks == []
+        and store.state[7]["state"] == "up"
+        and store.state[7]["consecutive_fails"] == 2
+        and sent == [],
+        f"_record_results: five probes that could not be made store no check, move no state and send no alert (got {store.state[7]}, {sent})",
+    )
+    check(
+        store.state[7]["last_error"] == "could not probe: ping could not be run",
+        "_record_results: the sentence is kept in last_error for the page",
+    )
+    w._record_results({8: {"id": 8, "fails_to_down": 3}}, {8: (None, None, "could not probe: x")}, base)
+    check(
+        store.state[8] == {"state": "unknown", "consecutive_fails": 0, "last_error": "could not probe: x"},
+        f"_record_results: a target never probed before gets an 'unknown' state row with the sentence (got {store.state.get(8)})",
+    )
+    w._record_results({7: {"id": 7, "fails_to_down": 3}}, {7: (False, None, "no reply")}, base)
+    check(
+        store.state[7]["state"] == "down" and sent == ["down"],
+        f"_record_results: a real failure after them still counts from where the count stood (got {store.state[7]}, {sent})",
+    )
+
+    def _probe_bug(t):
+        raise RuntimeError("probe code broke")
+
+    store = _Store(
+        [
+            {
+                "id": 1,
+                "ip": "10.1.0.5",
+                "probe": "ping",
+                "interval_min": 5,
+                "fails_to_down": 1,
+                "label": "",
+                "subnet_id": 1,
+                "mac": "",
+                "enabled": 1,
+            }
+        ]
+    )
+    w._get_db = lambda: store
+    w._probe_target = _probe_bug
+    sent.clear()
+    w._tick()
+    check(
+        store.checks == [] and sent == [] and store.state[1]["last_error"].startswith("could not probe"),
+        f"_tick: a probe that raises is 'could not probe', never a down alert (got {store.state.get(1)}, {sent})",
+    )
+
+    # ── 1.1.4 (WD-3): the label and the subnet name are escaped before they reach an alert ────────────────────────────
+    a = load_plugin()
+    api = sys.modules["jen.plugin_api"]
+    alert_calls = []
+    api.send_alert = lambda alert_type, **kw: alert_calls.append(kw)
+    api.emit = lambda *args, **kw: None
+    a._subnet_map = lambda: {1: {"name": "Lab <A&B>", "cidr": "10.1.0.0/24"}}
+    hostile = {"id": 1, "ip": "10.1.0.5", "label": "AT&T <gateway>", "subnet_id": 1, "mac": ""}
+    had_safe_text = hasattr(api, "safe_text")
+    if had_safe_text:
+        del api.safe_text
+    a._alert_transition(hostile, "down")
+    check(
+        alert_calls[-1]["label"] == "AT&amp;T &lt;gateway&gt;" and alert_calls[-1]["subnet"] == "Lab &lt;A&amp;B&gt;",
+        f"_alert_transition: on a Jen without safe_text the label and subnet name are escaped (got {alert_calls[-1]})",
+    )
+    api.safe_text = lambda value: "SAFE(" + str(value) + ")"
+    a._alert_transition(hostile, "down")
+    check(
+        alert_calls[-1]["label"] == "SAFE(AT&T <gateway>)",
+        f"_alert_transition: on a Jen that exports safe_text, Jen's own function is the one used (got {alert_calls[-1]})",
+    )
+    del api.safe_text, api.send_alert, api.emit
+
+    # ── 1.1.4 (WD-4): the template is the one Jen bundles - no browser alert(), and the could-not-probe line ──────────
+    page = pathlib.Path(ROOT, "templates", "watchdog", "index.html").read_text(encoding="utf-8")
+    check(
+        "alert(" not in page and 'id="wd-port-note"' in page,
+        "index.html: an empty port list is a field note, not a browser alert()",
+    )
+    check(
+        f"r.last_error.startswith('{a.COULD_NOT_PROBE}')" in page and 'data-wd-note="could-not-probe"' in page,
+        "index.html: a target whose probe could not be made says so under its state, keyed on the plugin's own prefix",
     )
 
     if failures:
