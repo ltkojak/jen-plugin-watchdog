@@ -1370,6 +1370,71 @@ def main():
         "index.html: a target whose probe could not be made says so under its state, keyed on the plugin's own prefix",
     )
 
+    # ── 1.1.5 (V52, addition 11): a page with no target shows the first steps, not an empty table and idle filters ────
+    import re as _re
+
+    first = page.find("{% if not rows %}\n{# v1.1.5")
+    other = page.find('{% else %}\n<div class="card">\n    <div class="flex gap-2 wrap" id="wd-filters">')
+    block = page[first:other]
+    steps = _re.findall(r"<li>(.*?)</li>", block, _re.S)
+    step_count = len(steps)
+    steps += [""] * 3  # a page with fewer steps fails the checks below one by one; it does not stop the run
+    check(
+        0 < first < other and '<div class="card first-run">' in block and "<h3>Getting started</h3>" in block,
+        "index.html: with no target the page shows one first-run card headed Getting started",
+    )
+    check(
+        step_count == 3
+        and 'class="btn btn-sm btn-primary wd-add-open">{{ icon("plus") }} Add Target</button>' in steps[0]
+        and "{% if is_admin %}" in steps[0],
+        f"index.html: the card has three steps and the first carries the Add Target button, for an admin (got {step_count})",
+    )
+    check(
+        "(5 minutes unless you pick a longer one)" in steps[1]
+        and "(3 unless you change it)" in steps[1]
+        and "{% if m == 5 %}selected{% endif %}" in page
+        and "{% if f == 3 %}selected{% endif %}" in page
+        and 5 in a._INTERVAL_CHOICES
+        and 3 in a._FAILS_CHOICES
+        and "_tick_every = 5" in src,
+        "index.html: the second step's 5 minutes and 3 failed checks are the form's own defaults and the tick's floor",
+    )
+    check(
+        '<a href="/settings/alerts">Settings - Alerts</a>' in steps[2]
+        and all(
+            f'"{label}"' in steps[2] and f'label="{label}"' in src
+            for label in ("Watchdog: host down", "Watchdog: host back up")
+        ),
+        "index.html: the third step links Settings - Alerts and names the two alerts by the labels register() gives them",
+    )
+    check(
+        page.find('id="wd-filters"') > other
+        and page.find('<table id="wd-table"') > other
+        and "No targets yet" not in page
+        and page.count("{% if not rows %}") == 2
+        and "{% if rows %}\ndocument.getElementById('wd-filters')" in page,
+        "index.html: the filters, their script and the table are drawn only when there is a target (no empty-table row)",
+    )
+    check(
+        "document.querySelectorAll('.wd-add-open')" in page
+        and 'id="wd-add-btn" class="btn btn-primary wd-add-open"' in page
+        and "getElementById('wd-add-btn')" not in page,
+        "index.html: the header's Add Target button and the first step's open the same dialog",
+    )
+    labels = []
+    for body in _re.findall(r"<button\b[^>]*>(.*?)</button>", page, _re.S):
+        text = _re.sub(r"\{\{.*?\}\}|\{%.*?%\}|<[^>]+>", " ", body, flags=_re.S)
+        labels.extend(w for w in text.split() if w[:1].isalpha())
+    check(
+        labels and all(w[:1].isupper() for w in labels),
+        f"index.html: every button's words are Title Case (got {sorted(set(labels))})",
+    )
+    check(
+        _re.search(r"\sstyle\s*=", page) is None
+        and page.count("<script") == page.count('<script nonce="{{ csp_nonce }}">'),
+        "index.html: the new markup carries no inline style and every script tag has its nonce",
+    )
+
     if failures:
         print(f"\n{len(failures)} check(s) failed")
         return 1
